@@ -181,7 +181,6 @@ python main.py scan_1.jpg -o out.json --pretty
 .
 ├── .gitignore        # игнорирование venv, .env, __pycache__ и т.д.
 ├── .env.example      # шаблон переменных окружения (скопировать в .env)
-├── env.example       # то же для удобства (без точки в имени)
 ├── main.py           # основной скрипт
 ├── requirements.txt  # зависимости Python
 └── README.md         # инструкция
