@@ -15,7 +15,7 @@ from datetime import datetime
 from typing import Any
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIError, OpenAI, OpenAIError
 
 try:
     from pdf2image import convert_from_path
@@ -33,41 +33,153 @@ VALID_ROLES = frozenset({
     "истец", "ответчик", "третье лицо", "судья", "представитель", "секретарь",
 })
 
-SYSTEM_PROMPT = """Ты – юридический ассистент. Проанализируй изображение страницы судебного решения. Извлеки структурированные данные согласно JSON-схеме. Требования:
-- ФИО: только в именительном падеже, полностью (Иванов Иван Иванович), без инициалов. Применяется к judge, plaintiff, defendant, third_party и people[].full_name.
-- role: строго из словаря: истец, ответчик, третье лицо, судья, представитель, секретарь.
-- legal_basis: формат "ст. N ГК РФ" или "ст. N АПК РФ" (и др.), без дублей.
-- key_findings: каждый вывод в виде {"finding": "текст", "evidence": "короткая цитата из решения"}. evidence обязателен для подтверждения вывода; если цитаты нет — пустая строка.
-Верни только JSON, без пояснений.
-
-{
-  "document_type": "...",
-  "court_name": "...",
-  "case_number": "...",
-  "date": "ДД-ММ-ГГГГ",
-  "judge": "...",
-  "plaintiff": "...",
-  "defendant": "...",
-  "third_party": "...",
-  "claim_amount": {"value": число, "currency": "руб."},
-  "claim_subject": "...",
-  "ruling": "...",
-  "legal_basis": ["ст. 1 ГК РФ", "ст. 2 АПК РФ"],
-  "summary": "Краткое резюме содержания страницы (если на странице нет существенной информации, оставь пустую строку)",
-  "key_findings": [
-    {"finding": "Суд отказал в иске", "evidence": "в связи с пропуском срока исковой давности, стр. 5"},
-    ...
-  ],
-  "people": [
-    {"full_name": "Иванов Иван Иванович", "role": "истец"},
-    ...
+# JSON Schema for Chat Completions Structured Outputs (strict).
+# Optional scalars are nullable; all object properties are required.
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "document_type": {"type": ["string", "null"]},
+        "court_name": {"type": ["string", "null"]},
+        "case_number": {"type": ["string", "null"]},
+        "date": {
+            "type": ["string", "null"],
+            "description": "Дата решения в формате YYYY-MM-DD, если надёжно извлечена",
+        },
+        "judge": {"type": ["string", "null"]},
+        "plaintiff": {"type": ["string", "null"]},
+        "defendant": {"type": ["string", "null"]},
+        "third_party": {"type": ["string", "null"]},
+        "claim_amount": {
+            "type": ["object", "null"],
+            "additionalProperties": False,
+            "properties": {
+                "value": {"type": ["number", "null"]},
+                "currency": {"type": ["string", "null"]},
+            },
+            "required": ["value", "currency"],
+        },
+        "claim_subject": {"type": ["string", "null"]},
+        "ruling": {"type": ["string", "null"]},
+        "legal_basis": {
+            "type": "array",
+            "items": {"type": "string"},
+        },
+        "summary": {
+            "type": "string",
+            "description": "Краткое резюме содержания текущей страницы; пустая строка, если нет существенной информации",
+        },
+        "key_findings": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "finding": {"type": "string"},
+                    "evidence": {"type": "string"},
+                },
+                "required": ["finding", "evidence"],
+            },
+        },
+        "people": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "full_name": {"type": "string"},
+                    "role": {"type": "string"},
+                },
+                "required": ["full_name", "role"],
+            },
+        },
+        "dates": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string"},
+                    "value": {"type": "string"},
+                },
+                "required": ["label", "value"],
+            },
+        },
+        "amounts": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "label": {"type": "string"},
+                    "value": {"type": "number"},
+                    "currency": {"type": "string"},
+                },
+                "required": ["label", "value", "currency"],
+            },
+        },
+        "tables": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "name": {"type": "string"},
+                    "columns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["name", "columns", "rows"],
+            },
+        },
+    },
+    "required": [
+        "document_type",
+        "court_name",
+        "case_number",
+        "date",
+        "judge",
+        "plaintiff",
+        "defendant",
+        "third_party",
+        "claim_amount",
+        "claim_subject",
+        "ruling",
+        "legal_basis",
+        "summary",
+        "key_findings",
+        "people",
+        "dates",
+        "amounts",
+        "tables",
     ],
-  "dates": [{"label": "дата договора", "value": "01-01-2023"}],
-  "amounts": [{"label": "цена иска", "value": 100000, "currency": "руб."}],
-  "tables": [{"name": "...", "columns": ["col1"], "rows": [["val1"]]}]
 }
 
-Обрати внимание: summary и key_findings формируются для текущей страницы; при объединении они будут агрегированы. Поля summary и key_findings должны присутствовать всегда (хотя бы пустой массив для key_findings и пустая строка для summary)."""
+RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "court_decision_extraction",
+        "strict": True,
+        "schema": EXTRACTION_SCHEMA,
+    },
+}
+
+SYSTEM_PROMPT = """Ты – юридический ассистент. Проанализируй изображение страницы судебного решения. Извлеки структурированные данные строго по JSON-схеме ответа. Требования:
+- ФИО: только в именительном падеже, полностью (Иванов Иван Иванович), без инициалов. Применяется к judge, plaintiff, defendant, third_party и people[].full_name.
+- role: предпочтительно из словаря: истец, ответчик, третье лицо, судья, представитель, секретарь. Если роль на странице иная — укажи её как есть; не подменяй неизвестную роль на «представитель». Если роль неизвестна — оставь пустую строку.
+- date и dates[].value: формат YYYY-MM-DD, только если дата надёжно читается; иначе date = null / не выдумывай дату.
+- legal_basis: указывай кодекс (ГК РФ, АПК РФ и т.п.) только если он явно виден или однозначно следует из текста на этой странице. Для голой ссылки вида «ст. N» без кодекса НЕ угадывай кодекс — верни «ст. N» как есть. Не добавляй правовую информацию, которой нет на странице. Без дублей.
+- key_findings: каждый вывод в виде {"finding": "текст", "evidence": "короткая цитата из решения"}. evidence обязателен для подтверждения вывода; если цитаты нет — пустая строка.
+- summary: краткое резюме содержания ТЕКУЩЕЙ страницы; если на странице нет существенной информации — пустая строка.
+Верни только JSON по схеме, без пояснений."""
 
 
 def encode_image_to_data_url(image_path: str) -> str:
@@ -98,34 +210,51 @@ def analyze_image(image_path: str, model: str = "gpt-4o") -> dict:
     client = OpenAI(api_key=api_key)
     image_data_url = encode_image_to_data_url(image_path)
 
-    completion = client.chat.completions.create(
-        model=model,
-        temperature=0.1,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "Проанализируй изображение страницы судебного решения. "
-                            "Извлеки структурированные данные по схеме. Верни только JSON."
-                        ),
-                    },
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_data_url},
-                    },
-                ],
-            },
-        ],
-    )
+    try:
+        completion = client.chat.completions.create(
+            model=model,
+            temperature=0.1,
+            response_format=RESPONSE_FORMAT,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Проанализируй изображение страницы судебного решения. "
+                                "Извлеки структурированные данные по схеме. Верни только JSON."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": image_data_url},
+                        },
+                    ],
+                },
+            ],
+        )
+    except APIError as e:
+        raise RuntimeError(f"Ошибка OpenAI API: {e}") from e
+    except OpenAIError as e:
+        raise RuntimeError(f"Ошибка клиента OpenAI: {e}") from e
 
-    content = completion.choices[0].message.content.strip()
+    if not completion.choices:
+        raise RuntimeError("Пустой ответ OpenAI API: нет choices в completion.")
 
-    # Убрать возможные markdown-обёртки
+    message = completion.choices[0].message
+    refusal = getattr(message, "refusal", None)
+    if refusal:
+        raise RuntimeError(f"Модель отказалась обработать запрос: {refusal}")
+
+    content = message.content
+    if content is None or not str(content).strip():
+        raise RuntimeError("Пустой ответ модели: отсутствует содержимое сообщения.")
+
+    content = str(content).strip()
+
+    # Убрать возможные markdown-обёртки (на случай нестандартного ответа)
     if content.startswith("```"):
         lines = content.split("\n")
         content = "\n".join(
@@ -137,12 +266,17 @@ def analyze_image(image_path: str, model: str = "gpt-4o") -> dict:
     except json.JSONDecodeError as e:
         raise ValueError(
             f"Не удалось распарсить ответ модели как JSON: {e}\nОтвет:\n{content[:500]}..."
+        ) from e
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Ожидался JSON-объект, получен {type(data).__name__}."
         )
 
     # Гарантируем наличие summary и key_findings
-    if "summary" not in data:
+    if "summary" not in data or data["summary"] is None:
         data["summary"] = ""
-    if "key_findings" not in data:
+    if "key_findings" not in data or data["key_findings"] is None:
         data["key_findings"] = []
 
     return data
@@ -152,8 +286,9 @@ def merge_results(partial_results: list[dict]) -> dict:
     """
     Объединяет частичные JSON-результаты по страницам в один итоговый документ.
     - Уникальные поля (court_name, case_number и т.д.): первое непустое значение.
+    - ruling: последнее непустое значение (резолютивная часть обычно ближе к концу).
     - Списки (people, dates, amounts, tables, key_findings): конкатенация.
-    - summary: самое длинное непустое резюме (или первое непустое).
+    - summary: самое длинное непустое резюме страницы (не синтез по всему документу).
     """
     if not partial_results:
         return {
@@ -161,7 +296,7 @@ def merge_results(partial_results: list[dict]) -> dict:
             "key_findings": [],
         }
 
-    # Поля, для которых берём первое непустое значение
+    # Поля, для которых берём первое непустое значение (кроме ruling)
     single_value_fields = [
         "document_type",
         "court_name",
@@ -172,7 +307,6 @@ def merge_results(partial_results: list[dict]) -> dict:
         "defendant",
         "third_party",
         "claim_subject",
-        "ruling",
     ]
 
     # Поля-списки: конкатенируем
@@ -186,6 +320,15 @@ def merge_results(partial_results: list[dict]) -> dict:
             if val is not None and (val != "" if isinstance(val, str) else True):
                 merged[key] = val
                 break
+
+    # ruling: последнее непустое (пустые поздние значения не затирают ранее найденное)
+    last_ruling = None
+    for part in partial_results:
+        val = part.get("ruling")
+        if val is not None and (val != "" if isinstance(val, str) else True):
+            last_ruling = val
+    if last_ruling is not None:
+        merged["ruling"] = last_ruling
 
     # claim_amount — одно значение, первое непустое
     for part in partial_results:
@@ -216,7 +359,7 @@ def merge_results(partial_results: list[dict]) -> dict:
         if combined:
             merged[key] = combined
 
-    # summary: самое длинное непустое (или первое непустое)
+    # summary: самое длинное непустое резюме страницы (не синтез всего документа)
     summaries = [p.get("summary", "") or "" for p in partial_results]
     non_empty = [s for s in summaries if s.strip()]
     if non_empty:
@@ -232,21 +375,23 @@ def merge_results(partial_results: list[dict]) -> dict:
 
 
 def _normalize_legal_basis(s: str) -> str | None:
-    """Нормализует статью к виду «ст. N ГК РФ» / «ст. N АПК РФ» и т.д."""
+    """Нормализует пробелы/формат «ст. N …»; не добавляет кодекс, если его не было."""
     if not s or not isinstance(s, str):
         return None
     s = s.strip()
     if not s:
         return None
-    # Приводим к единому формату: ст. N <КОДЕКС> РФ
-    m = re.search(r"ст\.?\s*(\d+(?:\s*/\s*\d+)?)\s*(.+)?", s, re.I)
+    m = re.search(r"ст\.?\s*(\d+(?:\s*/\s*\d+)?)\s*(.*)?", s, re.I)
     if m:
-        num, code = m.group(1), (m.group(2) or "").strip()
-        code = code or "ГК РФ"
-        if not code.upper().endswith("РФ"):
-            code = f"{code} РФ" if code else "ГК РФ"
-        return f"ст. {num} {code}"
-    return s if s.startswith("ст.") or "ст." in s else None
+        num = re.sub(r"\s+", "", m.group(1))
+        rest = re.sub(r"\s+", " ", (m.group(2) or "").strip())
+        if rest:
+            return f"ст. {num} {rest}"
+        return f"ст. {num}"
+    cleaned = re.sub(r"\s+", " ", s)
+    if cleaned.lower().startswith("ст.") or "ст." in cleaned.lower():
+        return cleaned
+    return None
 
 
 def _parse_number(val: Any) -> float | int | None:
@@ -268,25 +413,25 @@ def _parse_number(val: Any) -> float | int | None:
 
 
 def _parse_date(val: Any) -> str | None:
-    """Проверяет и нормализует дату к ГГГГ-ММ-ДД или ДД.ММ.ГГГГ."""
+    """Нормализует дату к YYYY-MM-DD. Непарсабельные значения → None (без выдумывания)."""
     if val is None:
         return None
     s = str(val).strip()
     if not s:
         return None
-    # ДД.ММ.ГГГГ, ДД-ММ-ГГГГ
     for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             dt = datetime.strptime(re.sub(r"\s+", "", s), fmt)
             return dt.strftime("%Y-%m-%d")
         except ValueError:
             continue
-    return s
+    return None
 
 
 def postprocess(data: dict) -> dict:
     """
     Постобработка: дедупликация people/legal_basis, валидация чисел и дат.
+    Не выводит кодексы и роли, которых не было в данных модели.
     """
     # Дедупликация people по (full_name, role)
     if "people" in data and isinstance(data["people"], list):
@@ -296,19 +441,25 @@ def postprocess(data: dict) -> dict:
             if not isinstance(p, dict):
                 continue
             name = (p.get("full_name") or "").strip()
-            role = (p.get("role") or "").strip().lower()
-            if role not in VALID_ROLES:
-                role = "представитель" if role else ""
+            raw_role = p.get("role")
+            if raw_role is None:
+                role = ""
+            else:
+                role = str(raw_role).strip()
+            role_key = role.lower()
+            if role_key in VALID_ROLES:
+                role = role_key
+            # unknown non-empty role: preserve as-is; empty stays empty
             if not name:
                 continue
             key = (name, role)
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"full_name": name, "role": role or "представитель"})
+            out.append({"full_name": name, "role": role})
         data["people"] = out
 
-    # Дедупликация legal_basis, нормализация формата
+    # Дедупликация legal_basis, нормализация формата без дописывания кодекса
     if "legal_basis" in data and isinstance(data["legal_basis"], list):
         seen_lb: set[str] = set()
         out_lb = []
@@ -345,9 +496,9 @@ def postprocess(data: dict) -> dict:
                 })
         data["amounts"] = out_amt
 
-    # Валидация dates
+    # Валидация dates: только надёжно распознанные → YYYY-MM-DD
     if "date" in data and data["date"]:
-        data["date"] = _parse_date(data["date"]) or data["date"]
+        data["date"] = _parse_date(data["date"])
     if "dates" in data and isinstance(data["dates"], list):
         out_dates = []
         for d in data["dates"]:
@@ -355,11 +506,12 @@ def postprocess(data: dict) -> dict:
                 continue
             val = d.get("value")
             parsed = _parse_date(val)
-            if parsed or val:
+            if parsed:
                 out_dates.append({
                     "label": (d.get("label") or "").strip() or "дата",
-                    "value": parsed or str(val),
+                    "value": parsed,
                 })
+            # непарсабельные даты не включаем и не выдумываем
         data["dates"] = out_dates
 
     # Нормализация key_findings к {finding, evidence}
